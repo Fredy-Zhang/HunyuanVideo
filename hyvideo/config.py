@@ -223,7 +223,7 @@ def add_inference_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--model-base",
         type=str,
-        default="ckpts",
+        default="../HunyuanVideo/ckpts",
         help="Root path of all the models, including t2v models and extra models.",
     )
     group.add_argument(
@@ -357,6 +357,113 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Enable reproducibility by setting random seeds and deterministic algorithms.",
     )
+
+    # ── ST Attention Cohesion ─────────────────────────────────────────────
+    group.add_argument(
+        "--enable-st-attn-cohesion",
+        action="store_true",
+        default=False,
+        help="Enable spatio-temporal attention cohesion.",
+    )
+    group.add_argument(
+        "--st-attn-spatial-topk-ratio",
+        type=float,
+        default=0.01,
+        help="Spatial top-k ratio for ST attention cohesion.",
+    )
+    group.add_argument(
+        "--st-attn-temporal-strength",
+        type=float,
+        default=0.35,
+        help="Temporal strength for ST attention cohesion.",
+    )
+    group.add_argument(
+        "--st-attn-background-suppress",
+        type=float,
+        default=0.10,
+        help="Background suppression weight for ST attention cohesion.",
+    )
+    group.add_argument(
+        "--st-attn-score-momentum",
+        type=float,
+        default=0.7,
+        help="Score momentum for ST attention cohesion.",
+    )
+    group.add_argument(
+        "--st-attn-localize-chunk-size",
+        type=int,
+        default=2048,
+        help="Chunk size for ST attention localization.",
+    )
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Glyph Guidance (OCR-guided sampling) ──────────────────────────────
+    group.add_argument(
+        "--glyph-guidance",
+        action="store_true",
+        default=False,
+        help="Enable OCR-guided sampling (manifold alignment in latent space). "
+             "Injects gradient corrections toward the clear-glyph manifold at each step.",
+    )
+    group.add_argument(
+        "--glyph-ocr-backend",
+        type=str,
+        default="clip",
+        choices=["clip", "trocr", "render"],
+        help="OCR backend for glyph guidance. "
+             "'clip' uses CLIP image-text similarity (fastest), "
+             "'trocr' uses TrOCR encoder features (most accurate), "
+             "'render' uses PIL-rendered glyph + pixel MSE (no model needed).",
+    )
+    group.add_argument(
+        "--glyph-eta",
+        type=float,
+        default=0.5,
+        help="Base guidance strength eta_0 for glyph guidance.",
+    )
+    group.add_argument(
+        "--glyph-sigma-min",
+        type=float,
+        default=0.2,
+        help="Lower sigma bound for applying glyph guidance (skip near-clean steps).",
+    )
+    group.add_argument(
+        "--glyph-sigma-max",
+        type=float,
+        default=0.8,
+        help="Upper sigma bound for applying glyph guidance (skip high-noise steps).",
+    )
+    group.add_argument(
+        "--glyph-target-text",
+        type=str,
+        default=None,
+        help="Explicit text string to render. If None, auto-extracted from the prompt.",
+    )
+    group.add_argument(
+        "--glyph-decode-resize",
+        type=float,
+        default=0.5,
+        help="Spatial resize factor before VAE decode during guidance (saves GPU memory).",
+    )
+    group.add_argument(
+        "--glyph-clip-model",
+        type=str,
+        default="openai/clip-vit-large-patch14",
+        help="CLIP model name/path for the 'clip' OCR backend.",
+    )
+    group.add_argument(
+        "--glyph-trocr-model",
+        type=str,
+        default="microsoft/trocr-base-printed",
+        help="TrOCR model name/path for the 'trocr' OCR backend.",
+    )
+    group.add_argument(
+        "--glyph-grad-clip",
+        type=float,
+        default=1.0,
+        help="Gradient norm clipping threshold for glyph guidance (0 = disabled).",
+    )
+    # ─────────────────────────────────────────────────────────────────────
 
     return parser
 

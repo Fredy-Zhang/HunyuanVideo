@@ -47,6 +47,8 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
+from ...guidance import GlyphGuidance
+from ...guidance.ocr_guidance import _extract_text_from_prompt
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -699,6 +701,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         enable_tiling: bool = False,
         n_tokens: Optional[int] = None,
         embedded_guidance_scale: Optional[float] = None,
+        # ── Glyph Guidance (OCR-guided sampling) ──────────────────────────
+        glyph_guidance: Optional[GlyphGuidance] = None,
+        glyph_target_text: Optional[str] = None,
+        # ──────────────────────────────────────────────────────────────────
         **kwargs,
     ):
         r"""
@@ -952,7 +958,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
 
-        # 7. Denoising loop
+        # 7. Prepare glyph guidance target text
+        _glyph_text = None
+        if glyph_guidance is not None:
+            if glyph_target_text is not None:
+                _glyph_text = glyph_target_text
+            elif isinstance(prompt, str):
+                _glyph_text = _extract_text_from_prompt(prompt)
+            elif isinstance(prompt, list) and len(prompt) > 0:
+                _glyph_text = _extract_text_from_prompt(prompt[0])
+            logger.info(f"[GlyphGuidance] target text: '{_glyph_text}'")
+
+        # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
@@ -1016,6 +1033,20 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         noise_pred_text,
                         guidance_rescale=self.guidance_rescale,
                     )
+
+                # ── Glyph Guidance: gradient correction toward the glyph manifold ──
+                # Applied after CFG but before the scheduler step so the correction
+                # is in the same coordinate frame as the Euler update.
+                # sigma_t = t / num_train_timesteps (flow matching linear schedule)
+                if glyph_guidance is not None and _glyph_text:
+                    sigma_t = t.float().item() / self.scheduler.config.num_train_timesteps
+                    latents = glyph_guidance.apply(
+                        latents=latents,
+                        noise_pred=noise_pred,
+                        sigma_t=sigma_t,
+                        target_text=_glyph_text,
+                    )
+                # ─────────────────────────────────────────────────────────────────
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(

@@ -1,10 +1,18 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from copy import deepcopy
+from pathlib import Path
 
 import torch
 import torch.nn as nn
-from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoTokenizer,
+    CLIPTextModel,
+    CLIPTokenizer,
+    LlavaForConditionalGeneration,
+)
 from transformers.utils import ModelOutput
 
 from ..constants import TEXT_ENCODER_PATH, TOKENIZER_PATH
@@ -13,6 +21,27 @@ from ..constants import PRECISION_TO_TYPE
 
 def use_default(value, default):
     return value if value is not None else default
+
+
+def resolve_component_path(component_type, requested_path, logger=None):
+    path = Path(requested_path)
+    if path.exists():
+        return str(path)
+
+    candidates = []
+    if component_type == "llm" and path.name == "text_encoder":
+        candidates.append(path.parent / "llava-llama-3-8b-v1_1-transformers")
+        candidates.extend(sorted(path.parent.glob("*llava*transformers*")))
+
+    for candidate in candidates:
+        if candidate.is_dir() and (candidate / "config.json").exists():
+            if logger is not None:
+                logger.warning(
+                    f"{requested_path} was not found. Falling back to compatible checkpoint layout at {candidate}"
+                )
+            return str(candidate)
+
+    return str(path)
 
 
 def load_text_encoder(
@@ -24,6 +53,9 @@ def load_text_encoder(
 ):
     if text_encoder_path is None:
         text_encoder_path = TEXT_ENCODER_PATH[text_encoder_type]
+    text_encoder_path = resolve_component_path(
+        text_encoder_type, text_encoder_path, logger=logger
+    )
     if logger is not None:
         logger.info(
             f"Loading text encoder model ({text_encoder_type}) from: {text_encoder_path}"
@@ -33,10 +65,19 @@ def load_text_encoder(
         text_encoder = CLIPTextModel.from_pretrained(text_encoder_path)
         text_encoder.final_layer_norm = text_encoder.text_model.final_layer_norm
     elif text_encoder_type == "llm":
-        text_encoder = AutoModel.from_pretrained(
-            text_encoder_path, low_cpu_mem_usage=True
-        )
-        text_encoder.final_layer_norm = text_encoder.norm
+        config = AutoConfig.from_pretrained(text_encoder_path)
+        if getattr(config, "model_type", None) == "llava":
+            llava_model = LlavaForConditionalGeneration.from_pretrained(
+                text_encoder_path, low_cpu_mem_usage=True
+            )
+            text_encoder = llava_model.language_model.model
+            text_encoder.final_layer_norm = text_encoder.norm
+            del llava_model
+        else:
+            text_encoder = AutoModel.from_pretrained(
+                text_encoder_path, low_cpu_mem_usage=True
+            )
+            text_encoder.final_layer_norm = text_encoder.norm
     else:
         raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
     # from_pretrained will ensure that the model is in eval mode.
@@ -60,6 +101,9 @@ def load_tokenizer(
 ):
     if tokenizer_path is None:
         tokenizer_path = TOKENIZER_PATH[tokenizer_type]
+    tokenizer_path = resolve_component_path(
+        tokenizer_type, tokenizer_path, logger=logger
+    )
     if logger is not None:
         logger.info(f"Loading tokenizer ({tokenizer_type}) from: {tokenizer_path}")
 

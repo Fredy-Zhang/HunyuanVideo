@@ -30,7 +30,7 @@ def main():
     # Start sampling
     # TODO: batch inference check
     outputs = hunyuan_video_sampler.predict(
-        prompt=args.prompt, 
+        prompt=args.prompt,
         height=args.video_size[0],
         width=args.video_size[1],
         video_length=args.video_length,
@@ -41,7 +41,8 @@ def main():
         num_videos_per_prompt=args.num_videos,
         flow_shift=args.flow_shift,
         batch_size=args.batch_size,
-        embedded_guidance_scale=args.embedded_cfg_scale
+        embedded_guidance_scale=args.embedded_cfg_scale,
+        glyph_target_text=args.glyph_target_text if hasattr(args, "glyph_target_text") else None,
     )
     samples = outputs['samples']
     

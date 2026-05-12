@@ -18,6 +18,7 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.modules.fp8_optimization import convert_fp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
+from hyvideo.guidance.ocr_guidance import build_glyph_guidance, GlyphGuidanceConfig
 
 try:
     import xfuser
@@ -408,6 +409,26 @@ class HunyuanVideoSampler(Inference):
         if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
             parallelize_transformer(self.pipeline)
 
+        # ── Glyph Guidance ───────────────────────────────────────────────
+        self.glyph_guidance = None
+        if getattr(args, "glyph_guidance", False):
+            logger.info(
+                f"[GlyphGuidance] Initialising OCR guidance with backend='{args.glyph_ocr_backend}'"
+            )
+            self.glyph_guidance = build_glyph_guidance(
+                vae=self.vae,
+                device=self.device,
+                ocr_backend=args.glyph_ocr_backend,
+                eta=args.glyph_eta,
+                guidance_sigma_min=args.glyph_sigma_min,
+                guidance_sigma_max=args.glyph_sigma_max,
+                decode_resize_factor=args.glyph_decode_resize,
+                clip_model=args.glyph_clip_model,
+                trocr_model=args.glyph_trocr_model,
+                grad_clip_norm=args.glyph_grad_clip,
+            )
+        # ────────────────────────────────────────────────────────────────
+
     def load_diffusion_pipeline(
         self,
         args,
@@ -624,6 +645,11 @@ class HunyuanVideoSampler(Inference):
         n_tokens = freqs_cos.shape[0]
 
         # ========================================================================
+        # Glyph guidance target text
+        # ========================================================================
+        glyph_target_text = getattr(self.args, "glyph_target_text", None) or kwargs.get("glyph_target_text", None)
+
+        # ========================================================================
         # Print infer args
         # ========================================================================
         debug_str = f"""
@@ -638,7 +664,8 @@ class HunyuanVideoSampler(Inference):
                 guidance_scale: {guidance_scale}
                       n_tokens: {n_tokens}
                     flow_shift: {flow_shift}
-       embedded_guidance_scale: {embedded_guidance_scale}"""
+       embedded_guidance_scale: {embedded_guidance_scale}
+              glyph_guidance: {self.glyph_guidance is not None}"""
         logger.debug(debug_str)
 
         # ========================================================================
@@ -663,6 +690,8 @@ class HunyuanVideoSampler(Inference):
             is_progress_bar=True,
             vae_ver=self.args.vae,
             enable_tiling=self.args.vae_tiling,
+            glyph_guidance=self.glyph_guidance,
+            glyph_target_text=glyph_target_text,
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt
