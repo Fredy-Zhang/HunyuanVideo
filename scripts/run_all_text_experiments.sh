@@ -34,7 +34,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXP_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ----------------------------- shared settings ------------------------------
-MODEL_BASE=${MODEL_BASE:-"${EXP_ROOT}/ckpts"}
+# Pretrained weights live in Hyv/ckpts (the parent of this HunyuanVideo repo).
+REPO_ROOT="$(cd "${EXP_ROOT}/.." && pwd)"
+MODEL_BASE=${MODEL_BASE:-"${REPO_ROOT}/ckpts"}
 DIT_WEIGHT=${DIT_WEIGHT:-"${MODEL_BASE}/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt"}
 SAVE_PATH=${SAVE_PATH:-"${EXP_ROOT}/results/all_text_experiments"}
 PROMPT=${PROMPT:-"A red car drives past a white fence"}
