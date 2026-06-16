@@ -2,6 +2,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from copy import deepcopy
 
+import json  # [debug-only] text-token string logging
+import os  # [debug-only] text-token string logging
+
 import torch
 import torch.nn as nn
 from transformers import CLIPTextModel, CLIPTokenizer, AutoTokenizer, AutoModel
@@ -330,12 +333,72 @@ class TextEncoder(nn.Module):
                 attention_mask = (
                     attention_mask[:, crop_start:] if use_attention_mask else None
                 )
+                # --- [debug-only] save tokenizer-decoded token strings ---------
+                # When HUNYUAN_DEBUG_TEXT_NORM=1, write a sidecar JSON whose
+                # token_ids/token_texts are aligned (post-crop) to the text
+                # sequence that enters the DiT, so the norm heatmaps can be
+                # labeled per token. Written once (first prompt encode), rank 0
+                # only. Does not affect encoding. Easy to remove: delete this
+                # block and the json/os imports.
+                if os.environ.get("HUNYUAN_DEBUG_TEXT_NORM", "0") == "1":
+                    self._maybe_save_token_texts(
+                        batch_encoding["input_ids"], crop_start
+                    )
 
         if output_hidden_states:
             return TextEncoderModelOutput(
                 last_hidden_state, attention_mask, outputs.hidden_states
             )
         return TextEncoderModelOutput(last_hidden_state, attention_mask)
+
+    # ------------------------------------------------------------------ #
+    # [debug-only] Save tokenizer-decoded token strings for the prompt.
+    # Companion to the text-token norm logger in hyvideo/modules/models.py.
+    # Writes a sidecar JSON (next to HUNYUAN_DEBUG_TEXT_NORM_PATH) with the
+    # token ids/strings aligned to the post-crop text sequence that feeds the
+    # DiT, so the norm heatmaps can be labeled per token. Written once per
+    # process (first prompt encode), rank 0 only. Easy to remove.
+    # ------------------------------------------------------------------ #
+    def _maybe_save_token_texts(self, input_ids, crop_start):
+        if getattr(self, "_dbg_tokens_written", False):
+            return
+
+        import torch.distributed as dist
+
+        is_rank0 = (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+        if not is_rank0:
+            return
+
+        # Align ids to the cropped text sequence that enters the DiT (batch 0).
+        ids = input_ids[0, crop_start:].tolist()
+        token_texts = self.tokenizer.convert_ids_to_tokens(ids)
+        prompt = self.tokenizer.decode(ids, skip_special_tokens=True).strip()
+
+        record = {
+            "prompt": prompt,
+            "crop_start": int(crop_start),
+            "token_ids": [int(i) for i in ids],
+            "token_texts": token_texts,
+        }
+
+        # Derive sidecar path from the norm-log path: <stem>.tokens.json
+        norm_path = os.environ.get(
+            "HUNYUAN_DEBUG_TEXT_NORM_PATH", "text_norm_debug.jsonl"
+        )
+        stem = norm_path[:-6] if norm_path.endswith(".jsonl") else norm_path
+        out_path = f"{stem}.tokens.json"
+
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+
+        self._dbg_tokens_written = True
 
     def forward(
         self,

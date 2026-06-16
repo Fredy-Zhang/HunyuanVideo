@@ -72,10 +72,26 @@ def load_jsonl(path):
     return before, after, ratio, np.asarray(steps)
 
 
-def save_heatmap(data, title, out_path):
+def load_token_texts(input_path, max_labels):
+    """Load the optional <stem>.tokens.json sidecar (prompt token strings)."""
+    stem = input_path[:-6] if input_path.endswith(".jsonl") else input_path
+    sidecar = f"{stem}.tokens.json"
+    if not os.path.exists(sidecar):
+        return None
+    with open(sidecar, "r") as f:
+        rec = json.load(f)
+    token_texts = rec.get("token_texts")
+    if not token_texts:
+        return None
+    print(f"loaded {len(token_texts)} token labels from {sidecar}")
+    # Only label the first `max_labels` tokens (the rest are usually padding).
+    return token_texts[:max_labels]
+
+
+def save_heatmap(data, title, out_path, token_texts=None):
     """Render a single [num_steps, txt_seq_len] array as a heatmap PNG."""
     num_steps, seq_len = data.shape
-    fig, ax = plt.subplots(figsize=(12, max(3, num_steps * 0.12 + 2)))
+    fig, ax = plt.subplots(figsize=(14, max(3, num_steps * 0.12 + 2)))
     im = ax.imshow(
         data,
         aspect="auto",
@@ -86,6 +102,11 @@ def save_heatmap(data, title, out_path):
     ax.set_xlabel("text token index")
     ax.set_ylabel("denoising step")
     ax.set_title(title)
+    if token_texts:
+        # Label each of the first N token columns with its decoded string.
+        n = min(len(token_texts), seq_len)
+        ax.set_xticks(np.arange(n) + 0.5)
+        ax.set_xticklabels(token_texts[:n], rotation=90, fontsize=6)
     fig.colorbar(im, ax=ax, label="L2 norm" if "ratio" not in title else "ratio")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -101,10 +122,18 @@ def main():
     parser.add_argument(
         "--outdir", required=True, help="Directory to write the heatmap PNGs."
     )
+    parser.add_argument(
+        "--max-token-labels",
+        type=int,
+        default=40,
+        help="Max number of leading token columns to label with decoded strings "
+        "(if a <stem>.tokens.json sidecar exists). The rest are usually padding.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
     before, after, ratio, _steps = load_jsonl(args.input)
+    token_texts = load_token_texts(args.input, args.max_token_labels)
     print(
         f"loaded {before.shape[0]} steps x {before.shape[1]} tokens from {args.input}"
     )
@@ -113,16 +142,19 @@ def main():
         before,
         "Text token L2 norm — before dual-stream",
         os.path.join(args.outdir, "text_norm_before_dual.png"),
+        token_texts=token_texts,
     )
     save_heatmap(
         after,
         "Text token L2 norm — after dual-stream (before single-stream)",
         os.path.join(args.outdir, "text_norm_after_dual.png"),
+        token_texts=token_texts,
     )
     save_heatmap(
         ratio,
         "Text token norm ratio — after / before",
         os.path.join(args.outdir, "text_norm_after_before_ratio.png"),
+        token_texts=token_texts,
     )
 
 
