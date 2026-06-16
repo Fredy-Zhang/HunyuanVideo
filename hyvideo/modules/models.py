@@ -653,6 +653,103 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         with open(path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
+    # ------------------------------------------------------------------ #
+    # [debug-only] Text-token boundary ablation.
+    # Zero real / padding / all text tokens right after the dual-stream blocks
+    # (before single-stream), to test whether padding positions act as memory
+    # slots. Real tokens are [0, real_end); padding is [real_end, txt_seq_len).
+    # Controlled by env vars:
+    #   HUNYUAN_TEXT_TOKEN_ABLATION_MODE = none | zero_real_tokens |
+    #                                      zero_pad_tokens | zero_all_text
+    #   HUNYUAN_TEXT_REAL_TOKEN_END      = real-token count (default 9)
+    #   HUNYUAN_TEXT_TOKEN_ABLATION_PATH = JSONL log path (optional)
+    #   HUNYUAN_TEXT_TOKEN_ABLATION_PROMPT = prompt string for the log (optional)
+    # Deterministic and identical across ranks (text is replicated under
+    # sequence parallelism), and a no-op when the mode env var is unset.
+    # Easy to remove: delete this method and its call site in forward().
+    # ------------------------------------------------------------------ #
+    def _apply_text_token_ablation(self, txt, mode, t, img_seq_len):
+        seq_len = txt.shape[1]
+        real_end = int(os.environ.get("HUNYUAN_TEXT_REAL_TOKEN_END", "9"))
+        real_end = max(0, min(real_end, seq_len))
+
+        def _mean_norm(x):
+            if x.shape[1] == 0:
+                return 0.0
+            return x.float().norm(dim=-1).mean().item()
+
+        with torch.no_grad():
+            before_txt = _mean_norm(txt)
+            before_real = _mean_norm(txt[:, :real_end])
+            before_pad = _mean_norm(txt[:, real_end:])
+
+        # Clone so we never mutate a tensor shared elsewhere; apply the ablation.
+        txt = txt.clone()
+        if mode == "zero_real_tokens":
+            txt[:, :real_end] = 0
+        elif mode == "zero_pad_tokens":
+            txt[:, real_end:] = 0
+        elif mode == "zero_all_text":
+            txt[:] = 0
+        # Unknown modes fall through unchanged (defensive).
+
+        with torch.no_grad():
+            after_txt = _mean_norm(txt)
+            after_real = _mean_norm(txt[:, :real_end])
+            after_pad = _mean_norm(txt[:, real_end:])
+
+        self._log_text_token_ablation(
+            mode, real_end, seq_len, img_seq_len, t,
+            before_txt, after_txt, before_real, after_real, before_pad, after_pad,
+        )
+        return txt
+
+    def _log_text_token_ablation(
+        self, mode, real_end, txt_seq_len, img_seq_len, t,
+        before_txt, after_txt, before_real, after_real, before_pad, after_pad,
+    ):
+        # rank 0 only when distributed.
+        import torch.distributed as dist
+
+        is_rank0 = (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+        if not is_rank0:
+            return
+
+        try:
+            timestep = float(t.flatten()[0].item())
+        except Exception:
+            timestep = None
+
+        record = {
+            "debug_stage": "text_token_ablation",
+            "prompt": os.environ.get("HUNYUAN_TEXT_TOKEN_ABLATION_PROMPT"),
+            "ablation_mode": mode,
+            "timestep": timestep,
+            "real_token_range": [0, int(real_end)],
+            "pad_token_range": [int(real_end), int(txt_seq_len)],
+            "txt_seq_len": int(txt_seq_len),
+            "img_seq_len": int(img_seq_len),
+            "before_ablation_txt_norm_mean": before_txt,
+            "after_ablation_txt_norm_mean": after_txt,
+            "real_token_norm_mean_before_ablation": before_real,
+            "real_token_norm_mean_after_ablation": after_real,
+            "pad_token_norm_mean_before_ablation": before_pad,
+            "pad_token_norm_mean_after_ablation": after_pad,
+        }
+
+        path = os.environ.get(
+            "HUNYUAN_TEXT_TOKEN_ABLATION_PATH", "text_token_ablation_debug.jsonl"
+        )
+        debug_dir = os.path.dirname(path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
     def forward(
         self,
         x: torch.Tensor,
@@ -738,6 +835,15 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         # --- [debug-only] log per-token text norms before the single-stream merge ---
         if _debug_text_norm:
             self._log_text_token_norm(txt_before_dual, txt, t)
+
+        # --- [debug-only] text-token boundary ablation (env-gated, no-op by default) ---
+        # Zero out real / padding / all text tokens right after the dual-stream
+        # blocks (before the single-stream merge) to test whether padding
+        # positions act as memory slots. Controlled by
+        # HUNYUAN_TEXT_TOKEN_ABLATION_MODE; does not touch text before dual-stream.
+        _ablation_mode = os.environ.get("HUNYUAN_TEXT_TOKEN_ABLATION_MODE", "none")
+        if _ablation_mode != "none":
+            txt = self._apply_text_token_ablation(txt, _ablation_mode, t, img_seq_len)
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
