@@ -60,6 +60,10 @@ def slugify(text):
 
 def prompt_from_filename(path):
     stem = os.path.splitext(os.path.basename(path))[0]
+    # Strip the "<timestamp>_seed<NN>_" prefix that sample_video.py prepends.
+    m = re.search(r"seed\d+_(.*)$", stem)
+    if m:
+        stem = m.group(1)
     return re.sub(r"[_]+", " ", stem).strip()
 
 
