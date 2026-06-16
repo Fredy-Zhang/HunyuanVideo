@@ -1,6 +1,9 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
 
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -580,6 +583,237 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+        # --- Inference-only text-token experiments / diagnostics ---
+        # All default to no-op so normal generation behavior is unchanged.
+        self.single_stream_text_skip = getattr(
+            args, "single_stream_text_skip", "none"
+        )
+        self.single_stream_text_skip_alpha = getattr(
+            args, "single_stream_text_skip_alpha", 0.0
+        )
+        self.single_stream_text_skip_mid_block = getattr(
+            args, "single_stream_text_skip_mid_block", 10
+        )
+        self.single_stream_text_ablation = getattr(
+            args, "single_stream_text_ablation", "none"
+        )
+        self.single_stream_text_scale = getattr(args, "single_stream_text_scale", 1.0)
+        self.single_stream_debug_stats = getattr(
+            args, "single_stream_debug_stats", False
+        )
+        self.single_stream_debug_blocks = self._parse_block_indices(
+            getattr(args, "single_stream_debug_blocks", "0,10,20,30,39")
+        )
+        self.single_stream_debug_path = getattr(args, "single_stream_debug_path", "")
+
+        # Token drift diagnostics (dual -> single text-token evolution).
+        self.token_drift_debug = getattr(args, "token_drift_debug", False)
+        self.token_drift_debug_path = (
+            getattr(args, "token_drift_debug_path", "") or "token_drift_debug.jsonl"
+        )
+        self.token_drift_debug_blocks = self._parse_block_indices(
+            getattr(args, "token_drift_debug_blocks", "-1,0,10,20,30,39")
+        )
+
+    @staticmethod
+    def _parse_block_indices(block_str):
+        """Parse a comma-separated string of block indices into a set of ints."""
+        indices = set()
+        if not block_str:
+            return indices
+        for part in str(block_str).split(","):
+            part = part.strip()
+            if part:
+                indices.add(int(part))
+        return indices
+
+    @staticmethod
+    def _per_token_rms(x, eps=1e-6):
+        """Per-token RMS over the feature dim, computed in float32. Shape [B, L, 1]."""
+        return x.float().pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+
+    def _apply_single_stream_text_skip(self, txt_after_dual, txt_before_dual, txt_mid):
+        """Semantic text skip connection applied right before the single-stream stage.
+
+        Re-injects clean pre-dual prompt semantics into the video-conditioned
+        text tokens. Inference-only; a no-op when the skip mode is 'none' or
+        alpha is 0. The injected feature is RMS norm-matched to the post-dual
+        text (except 'raw') because the post-dual text norm is far larger.
+        """
+        mode = self.single_stream_text_skip
+        alpha = self.single_stream_text_skip_alpha
+        if mode == "none" or alpha == 0.0:
+            return txt_after_dual
+
+        if mode == "raw":
+            anchor = txt_before_dual
+        elif mode == "norm_match":
+            scale = self._per_token_rms(txt_after_dual) / self._per_token_rms(
+                txt_before_dual
+            )
+            anchor = (txt_before_dual.float() * scale).to(txt_after_dual.dtype)
+        elif mode == "mid":
+            if txt_mid is None:
+                return txt_after_dual
+            scale = self._per_token_rms(txt_after_dual) / self._per_token_rms(txt_mid)
+            anchor = (txt_mid.float() * scale).to(txt_after_dual.dtype)
+        else:
+            return txt_after_dual
+
+        return txt_after_dual + alpha * anchor
+
+    def _apply_single_stream_text_ablation(self, txt):
+        """Optionally ablate text tokens right before the single-stream stage.
+
+        Returns the (possibly modified) text tensor. Inference-only; a no-op
+        when the ablation mode is 'none'.
+        """
+        mode = self.single_stream_text_ablation
+        if mode == "none":
+            return txt
+        if mode == "zero":
+            return torch.zeros_like(txt)
+        if mode == "shuffle":
+            idx = torch.randperm(txt.shape[1], device=txt.device)
+            return txt[:, idx, :]
+        if mode == "scale":
+            return txt * self.single_stream_text_scale
+        return txt
+
+    def _log_single_stream_stats(self, block_idx, x, img_seq_len, txt_seq_len):
+        """Compute and record cheap pooled token statistics (inference-only).
+
+        Only rank 0 records when distributed is initialized. No full tensors
+        are saved. When a debug path is set, JSON lines are appended; otherwise
+        the record is printed.
+        """
+        if not self.single_stream_debug_stats:
+            return
+
+        if not self._token_drift_is_rank0():
+            return
+
+        with torch.no_grad():
+            img_part = x[:, :img_seq_len].float()
+            txt_part = x[:, img_seq_len:].float()
+
+            img_pooled = img_part.mean(dim=1)
+            txt_pooled = txt_part.mean(dim=1)
+
+            record = {
+                "block_idx": int(block_idx),
+                "img_seq_len": int(img_seq_len),
+                "txt_seq_len": int(txt_seq_len),
+                "ablation": self.single_stream_text_ablation,
+                "img_norm_mean": img_part.norm(dim=-1).mean().item(),
+                "txt_norm_mean": txt_part.norm(dim=-1).mean().item(),
+                "img_mean_norm": img_pooled.norm(dim=-1).mean().item(),
+                "txt_mean_norm": txt_pooled.norm(dim=-1).mean().item(),
+                "img_txt_mean_cos": F.cosine_similarity(
+                    img_pooled, txt_pooled, dim=-1
+                ).mean().item(),
+            }
+
+        if self.single_stream_debug_path:
+            debug_dir = os.path.dirname(self.single_stream_debug_path)
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+            with open(self.single_stream_debug_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        else:
+            print(f"[single_stream_stats] {json.dumps(record)}")
+
+    @staticmethod
+    def _token_drift_is_rank0():
+        import torch.distributed as dist
+
+        return (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+
+    def _write_token_drift_record(self, record):
+        """Append one JSON object to the token drift JSONL file (rank 0 only)."""
+        if not self._token_drift_is_rank0():
+            return
+        debug_dir = os.path.dirname(self.token_drift_debug_path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        with open(self.token_drift_debug_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _log_token_drift_dual(
+        self, txt_before_dual, txt_after_dual, img_after_dual, img_seq_len, txt_seq_len
+    ):
+        """Log how text tokens drift from before dual-stream to before single-stream."""
+        if not self.token_drift_debug:
+            return
+        if not self._token_drift_is_rank0():
+            return
+
+        with torch.no_grad():
+            txt_before = txt_before_dual.float()
+            txt_after = txt_after_dual.float()
+            img_after = img_after_dual.float()
+
+            txt_before_mean = txt_before.mean(dim=1)
+            txt_after_mean = txt_after.mean(dim=1)
+            img_after_mean = img_after.mean(dim=1)
+
+            record = {
+                "debug_stage": "dual_to_single_drift",
+                "batch_size": int(txt_after.shape[0]),
+                "img_seq_len": int(img_seq_len),
+                "txt_seq_len": int(txt_seq_len),
+                "txt_drift_cos": F.cosine_similarity(
+                    txt_before_mean, txt_after_mean, dim=-1
+                ).mean().item(),
+                "txt_drift_l2": (txt_before_mean - txt_after_mean)
+                .norm(dim=-1).mean().item(),
+                "txt_before_dual_norm_mean": txt_before.norm(dim=-1).mean().item(),
+                "txt_after_dual_norm_mean": txt_after.norm(dim=-1).mean().item(),
+                "img_after_dual_norm_mean": img_after.norm(dim=-1).mean().item(),
+                "img_txt_after_dual_cos": F.cosine_similarity(
+                    img_after_mean, txt_after_mean, dim=-1
+                ).mean().item(),
+            }
+
+        self._write_token_drift_record(record)
+
+    def _log_token_drift_single(self, block_idx, x, img_seq_len, txt_seq_len):
+        """Log text-video alignment for a single-stream block (block_idx=-1=pre-loop)."""
+        if not self.token_drift_debug:
+            return
+        if block_idx not in self.token_drift_debug_blocks:
+            return
+        if not self._token_drift_is_rank0():
+            return
+
+        with torch.no_grad():
+            img_part = x[:, :img_seq_len].float()
+            txt_part = x[:, img_seq_len:].float()
+
+            img_pooled = img_part.mean(dim=1)
+            txt_pooled = txt_part.mean(dim=1)
+
+            record = {
+                "debug_stage": "single_block",
+                "block_idx": int(block_idx),
+                "batch_size": int(x.shape[0]),
+                "img_seq_len": int(img_seq_len),
+                "txt_seq_len": int(txt_seq_len),
+                "img_norm_mean": img_part.norm(dim=-1).mean().item(),
+                "txt_norm_mean": txt_part.norm(dim=-1).mean().item(),
+                "img_mean_norm": img_pooled.norm(dim=-1).mean().item(),
+                "txt_mean_norm": txt_pooled.norm(dim=-1).mean().item(),
+                "img_txt_mean_cos": F.cosine_similarity(
+                    img_pooled, txt_pooled, dim=-1
+                ).mean().item(),
+            }
+
+        self._write_token_drift_record(record)
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -641,6 +875,17 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 f"Unsupported text_projection: {self.text_projection}"
             )
 
+        # Snapshot the projected (clean prompt-semantic) text tokens before any
+        # dual-stream processing. Needed by the semantic skip connection and the
+        # token-drift diagnostic; cheap reference, no-op when both are disabled.
+        capture_pre_dual_text = (
+            self.single_stream_text_skip in ("raw", "norm_match")
+            or self.token_drift_debug
+        )
+        txt_before_dual = txt if capture_pre_dual_text else None
+        # Text output of an intermediate double-stream block, for the 'mid' skip.
+        txt_mid = None
+
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
 
@@ -652,7 +897,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
+        capture_mid_text = self.single_stream_text_skip == "mid"
+        for layer_idx, block in enumerate(self.double_blocks):
             double_block_args = [
                 img,
                 txt,
@@ -666,10 +912,32 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
             img, txt = block(*double_block_args)
 
+            # Capture the intermediate text output for the 'mid' skip connection.
+            if capture_mid_text and layer_idx == self.single_stream_text_skip_mid_block:
+                txt_mid = txt
+
+        # Token drift diagnostic: text tokens are now video-conditioned. Log how
+        # far they drifted from their pre-dual (prompt-semantic) state and how
+        # coupled they are with the image tokens (before any skip modifies txt).
+        self._log_token_drift_dual(
+            txt_before_dual, txt, img, img_seq_len, txt_seq_len
+        )
+
+        # Semantic text skip connection: re-inject clean pre-dual prompt
+        # semantics into the video-conditioned text before the single-stream
+        # stage. No-op unless --single-stream-text-skip is set with alpha > 0.
+        txt = self._apply_single_stream_text_skip(txt, txt_before_dual, txt_mid)
+
+        # Optional text-token ablation right before the single-stream stage.
+        txt = self._apply_single_stream_text_ablation(txt)
+
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
+        # Diagnostics for the merged tensor before the first single-stream block.
+        self._log_single_stream_stats(-1, x, img_seq_len, txt_seq_len)
+        self._log_token_drift_single(-1, x, img_seq_len, txt_seq_len)
         if len(self.single_blocks) > 0:
-            for _, block in enumerate(self.single_blocks):
+            for blk_idx, block in enumerate(self.single_blocks):
                 single_block_args = [
                     x,
                     vec,
@@ -682,6 +950,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 ]
 
                 x = block(*single_block_args)
+
+                if (
+                    self.single_stream_debug_stats
+                    and blk_idx in self.single_stream_debug_blocks
+                ):
+                    self._log_single_stream_stats(blk_idx, x, img_seq_len, txt_seq_len)
+                self._log_token_drift_single(blk_idx, x, img_seq_len, txt_seq_len)
 
         img = x[:, :img_seq_len, ...]
 
