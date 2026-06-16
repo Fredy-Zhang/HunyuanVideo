@@ -750,6 +750,196 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         with open(path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
+    @staticmethod
+    def _dbg_is_rank0():
+        # [debug-only] True unless we are a non-zero rank in a distributed run.
+        import torch.distributed as dist
+
+        return (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+
+    # ------------------------------------------------------------------ #
+    # [debug-only] Semantic anchor token expansion.
+    # After the final dual-stream block, copy clean pre-dual real text tokens
+    # (or post-dual real tokens) into the first unused padding slots, then make
+    # them visible to the single-stream attention by recomputing cu_seqlens from
+    # an updated text mask. Real tokens [0, real_end); anchors
+    # [real_end, real_end + repeat*real_end); padding after. Controlled by:
+    #   HUNYUAN_TEXT_ANCHOR_EXPANSION_MODE = none | duplicate_before_dual |
+    #       duplicate_before_dual_normmatch | duplicate_after_dual
+    #   HUNYUAN_TEXT_REAL_TOKEN_END (default 9), HUNYUAN_TEXT_ANCHOR_REPEAT (1),
+    #   HUNYUAN_TEXT_ANCHOR_ALPHA (1.0), HUNYUAN_TEXT_ANCHOR_DEBUG_PATH,
+    #   HUNYUAN_TEXT_ANCHOR_PROMPT, HUNYUAN_TEXT_ANCHOR_TOKENS_JSON (optional
+    #   token_texts for the first-step inspection). Deterministic across ranks.
+    # Easy to remove: delete these methods and the call site in forward().
+    # ------------------------------------------------------------------ #
+    def _apply_text_anchor_expansion(
+        self, txt_after_dual, txt_before_dual, text_mask, mode, t,
+        img_seq_len, txt_seq_len, cu_seqlens_q_orig,
+    ):
+        seq_len = txt_after_dual.shape[1]
+        real_end = int(os.environ.get("HUNYUAN_TEXT_REAL_TOKEN_END", "9"))
+        repeat = int(os.environ.get("HUNYUAN_TEXT_ANCHOR_REPEAT", "1"))
+        alpha = float(os.environ.get("HUNYUAN_TEXT_ANCHOR_ALPHA", "1.0"))
+        real_end = max(0, min(real_end, seq_len))
+        real_len = real_end  # anchor block = copy of the real tokens
+        anchor_start = real_end
+        anchor_end = real_end + repeat * real_len
+
+        # Safety: skip if there is no room (or nothing to copy).
+        if real_len == 0 or repeat < 1 or anchor_end > seq_len:
+            if not getattr(self, "_dbg_anchor_warned", False):
+                print(
+                    f"[anchor_expansion] skip: real_end={real_end} repeat={repeat} "
+                    f"-> anchor_end={anchor_end} > txt_seq_len={seq_len}; "
+                    f"prompt too long for expansion."
+                )
+                self._dbg_anchor_warned = True
+            return txt_after_dual, cu_seqlens_q_orig
+
+        def _rms(x):
+            return x.float().pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+
+        def _mean_norm(x):
+            if x.shape[1] == 0:
+                return 0.0
+            return x.float().norm(dim=-1).mean().item()
+
+        after_real = txt_after_dual[:, :real_end]
+        real_norm_after_dual = _mean_norm(after_real)
+
+        # Build one anchor block of length real_len.
+        if mode == "duplicate_after_dual":
+            anchor = alpha * after_real
+        elif mode == "duplicate_before_dual":
+            anchor = txt_before_dual[:, :real_end]
+        elif mode == "duplicate_before_dual_normmatch":
+            before_real = txt_before_dual[:, :real_end]
+            scale = _rms(after_real) / _rms(before_real)
+            anchor = alpha * (before_real.float() * scale)
+        else:
+            return txt_after_dual, cu_seqlens_q_orig
+        anchor = anchor.to(txt_after_dual.dtype)
+
+        # Write anchors into the padding region (clone to avoid shared mutation).
+        txt = txt_after_dual.clone()
+        tiled = anchor.repeat(1, repeat, 1) if repeat > 1 else anchor
+        txt[:, anchor_start:anchor_end] = tiled
+
+        # Make the anchor tokens visible to single-stream by recomputing cu_seqlens
+        # from an updated mask: [0, anchor_end) visible, the rest padding.
+        new_mask = text_mask.clone()
+        new_mask[:, :anchor_end] = 1
+        new_mask[:, anchor_end:] = 0
+        cu_seqlens_q_single = get_cu_seqlens(new_mask, img_seq_len)
+
+        mask_sum_before = int(text_mask[0].sum().item())
+        mask_sum_after = int(new_mask[0].sum().item())
+
+        self._log_text_anchor_expansion(
+            mode, t, txt_seq_len, img_seq_len, real_end, anchor_start, anchor_end,
+            alpha, mask_sum_before, mask_sum_after, real_norm_after_dual,
+            _mean_norm(tiled), _mean_norm(txt[:, anchor_end:]),
+        )
+        self._maybe_write_anchor_token_inspection(
+            mode, real_end, anchor_start, repeat, real_len,
+            mask_sum_before, mask_sum_after,
+        )
+        return txt, cu_seqlens_q_single
+
+    def _log_text_anchor_expansion(
+        self, mode, t, txt_seq_len, img_seq_len, real_end, anchor_start, anchor_end,
+        alpha, mask_sum_before, mask_sum_after, real_norm, anchor_norm, pad_norm,
+    ):
+        if not self._dbg_is_rank0():
+            return
+        try:
+            timestep = float(t.flatten()[0].item())
+        except Exception:
+            timestep = None
+        record = {
+            "debug_stage": "text_anchor_expansion",
+            "mode": mode,
+            "prompt": os.environ.get("HUNYUAN_TEXT_ANCHOR_PROMPT"),
+            "timestep": timestep,
+            "txt_seq_len": int(txt_seq_len),
+            "img_seq_len": int(img_seq_len),
+            "real_token_range": [0, int(real_end)],
+            "anchor_token_range": [int(anchor_start), int(anchor_end)],
+            "pad_token_range": [int(anchor_end), int(txt_seq_len)],
+            "text_mask_sum_before": int(mask_sum_before),
+            "text_mask_sum_after": int(mask_sum_after),
+            "anchor_alpha": float(alpha),
+            "real_norm_mean_after_dual": real_norm,
+            "anchor_norm_mean": anchor_norm,
+            "pad_norm_mean_after_expansion": pad_norm,
+        }
+        path = os.environ.get(
+            "HUNYUAN_TEXT_ANCHOR_DEBUG_PATH", "text_anchor_expansion_debug.jsonl"
+        )
+        debug_dir = os.path.dirname(path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _maybe_write_anchor_token_inspection(
+        self, mode, real_end, anchor_start, repeat, real_len,
+        mask_sum_before, mask_sum_after,
+    ):
+        if getattr(self, "_dbg_anchor_inspect_written", False):
+            return
+        if not self._dbg_is_rank0():
+            return
+
+        # Optional decoded token strings (e.g. from the .tokens.json sidecar).
+        token_texts = None
+        tj = os.environ.get("HUNYUAN_TEXT_ANCHOR_TOKENS_JSON", "")
+        if tj and os.path.exists(tj):
+            try:
+                with open(tj) as f:
+                    token_texts = json.load(f).get("token_texts")
+            except Exception:
+                token_texts = None
+
+        def tok(i):
+            if token_texts is not None and 0 <= i < len(token_texts):
+                return token_texts[i]
+            return None
+
+        real_tokens = [{"index": i, "token": tok(i)} for i in range(real_end)]
+        anchor_tokens = []
+        for r in range(repeat):
+            for j in range(real_len):
+                idx = anchor_start + r * real_len + j
+                anchor_tokens.append(
+                    {"index": idx, "copied_from": j, "token": tok(j)}
+                )
+
+        record = {
+            "prompt": os.environ.get("HUNYUAN_TEXT_ANCHOR_PROMPT"),
+            "mode": mode,
+            "real_tokens": real_tokens,
+            "anchor_tokens": anchor_tokens,
+            "text_mask_sum_before": int(mask_sum_before),
+            "text_mask_sum_after": int(mask_sum_after),
+        }
+
+        path = os.environ.get(
+            "HUNYUAN_TEXT_ANCHOR_DEBUG_PATH", "text_anchor_expansion_debug.jsonl"
+        )
+        stem = path[:-6] if path.endswith(".jsonl") else path
+        out_path = f"{stem}.token_inspection.json"
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        self._dbg_anchor_inspect_written = True
+
     def forward(
         self,
         x: torch.Tensor,
@@ -805,7 +995,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         # tokens right before the single-stream merge. Easy to remove: delete this
         # block, the matching `_log_text_token_norm` call below, and the method.
         _debug_text_norm = os.environ.get("HUNYUAN_DEBUG_TEXT_NORM", "0") == "1"
-        txt_before_dual = txt if _debug_text_norm else None
+        # The semantic anchor expansion (below) may also need the pre-dual text.
+        _anchor_mode = os.environ.get("HUNYUAN_TEXT_ANCHOR_EXPANSION_MODE", "none")
+        _need_before_dual = _debug_text_norm or _anchor_mode in (
+            "duplicate_before_dual",
+            "duplicate_before_dual_normmatch",
+        )
+        txt_before_dual = txt if _need_before_dual else None
 
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
@@ -845,6 +1041,21 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         if _ablation_mode != "none":
             txt = self._apply_text_token_ablation(txt, _ablation_mode, t, img_seq_len)
 
+        # --- [debug-only] semantic anchor token expansion (env-gated, no-op default) ---
+        # Copy clean before-dual text into unused padding positions just after the
+        # real tokens and make them visible to single-stream by recomputing
+        # cu_seqlens from an updated text mask. Controlled by
+        # HUNYUAN_TEXT_ANCHOR_EXPANSION_MODE. Single-stream uses the recomputed
+        # cu_seqlens; double-stream above is untouched.
+        cu_seqlens_q_single = cu_seqlens_q
+        cu_seqlens_kv_single = cu_seqlens_kv
+        if _anchor_mode != "none":
+            txt, cu_seqlens_q_single = self._apply_text_anchor_expansion(
+                txt, txt_before_dual, text_mask, _anchor_mode, t,
+                img_seq_len, txt_seq_len, cu_seqlens_q,
+            )
+            cu_seqlens_kv_single = cu_seqlens_q_single
+
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
         if len(self.single_blocks) > 0:
@@ -853,8 +1064,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     x,
                     vec,
                     txt_seq_len,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
+                    cu_seqlens_q_single,
+                    cu_seqlens_kv_single,
                     max_seqlen_q,
                     max_seqlen_kv,
                     (freqs_cos, freqs_sin),
