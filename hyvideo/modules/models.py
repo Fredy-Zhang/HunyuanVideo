@@ -1,6 +1,9 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
 
+import json  # [debug-only] text-token norm logging
+import os  # [debug-only] text-token norm logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -592,6 +595,64 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         for block in self.single_blocks:
             block.disable_deterministic()
 
+    # ------------------------------------------------------------------ #
+    # [debug-only] Text-token norm logging.
+    # Append one JSON line per denoising step with the per-token L2 norm of the
+    # text tokens before vs after the dual-stream blocks (right before the
+    # single-stream merge). Enabled with HUNYUAN_DEBUG_TEXT_NORM=1; output path
+    # via HUNYUAN_DEBUG_TEXT_NORM_PATH (default text_norm_debug.jsonl). Saves only
+    # per-token scalar norms (256 floats), never full embeddings, and never alters
+    # generation. To remove this feature entirely, delete this method, its call
+    # site in forward(), the `txt_before_dual` snapshot, and the json/os imports.
+    # ------------------------------------------------------------------ #
+    def _log_text_token_norm(self, txt_before_dual, txt_after_dual, t):
+        # Only rank 0 writes when running distributed (multi-GPU).
+        import torch.distributed as dist
+
+        is_rank0 = (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_rank() == 0
+        )
+        if not is_rank0:
+            return
+
+        path = os.environ.get(
+            "HUNYUAN_DEBUG_TEXT_NORM_PATH", "text_norm_debug.jsonl"
+        )
+
+        with torch.no_grad():
+            # Batch size 1 is the primary use case: log the first batch element.
+            before = txt_before_dual[0].float().norm(dim=-1)  # [txt_seq_len]
+            after = txt_after_dual[0].float().norm(dim=-1)  # [txt_seq_len]
+            ratio = after / before.clamp_min(1e-8)
+
+            # Per-module step counter (lazily initialized so __init__ stays clean).
+            step_idx = getattr(self, "_dbg_text_norm_step", 0)
+            self._dbg_text_norm_step = step_idx + 1
+
+            try:
+                timestep = float(t.flatten()[0].item())
+            except Exception:
+                timestep = None
+
+            record = {
+                "debug_stage": "text_token_norm",
+                "step_idx": int(step_idx),
+                "timestep": timestep,
+                "txt_seq_len": int(after.shape[0]),
+                "hidden_dim": int(txt_after_dual.shape[-1]),
+                "txt_before_dual_norm": before.tolist(),
+                "txt_after_dual_norm": after.tolist(),
+                "txt_after_before_ratio": ratio.tolist(),
+            }
+
+        debug_dir = os.path.dirname(path)
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
     def forward(
         self,
         x: torch.Tensor,
@@ -641,6 +702,14 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 f"Unsupported text_projection: {self.text_projection}"
             )
 
+        # --- [debug-only] text-token norm logging (env-gated, no-op by default) ---
+        # Enabled with HUNYUAN_DEBUG_TEXT_NORM=1. Snapshot the text tokens just
+        # before the dual-stream blocks; they are compared against the post-dual
+        # tokens right before the single-stream merge. Easy to remove: delete this
+        # block, the matching `_log_text_token_norm` call below, and the method.
+        _debug_text_norm = os.environ.get("HUNYUAN_DEBUG_TEXT_NORM", "0") == "1"
+        txt_before_dual = txt if _debug_text_norm else None
+
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
 
@@ -665,6 +734,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             ]
 
             img, txt = block(*double_block_args)
+
+        # --- [debug-only] log per-token text norms before the single-stream merge ---
+        if _debug_text_norm:
+            self._log_text_token_norm(txt_before_dual, txt, t)
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
