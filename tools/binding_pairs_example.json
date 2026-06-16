@@ -1,0 +1,25 @@
+[
+  {
+    "pair_id": "pair_00",
+    "prompt_a": "A red car drives past a white fence",
+    "prompt_b": "A blue car drives past a white fence",
+    "attribute_a": "red",
+    "attribute_b": "blue",
+    "object": "car",
+    "background_object": "white fence"
+  },
+  {
+    "pair_id": "pair_01",
+    "prompt_a": "A yellow duck next to a blue towel",
+    "prompt_b": "A blue duck next to a yellow towel",
+    "attribute_object_pairs_a": [["yellow", "duck"], ["blue", "towel"]],
+    "attribute_object_pairs_b": [["blue", "duck"], ["yellow", "towel"]]
+  },
+  {
+    "pair_id": "pair_02",
+    "prompt_a": "A green kite flying above a gray house",
+    "prompt_b": "A gray kite flying above a green house",
+    "attribute_object_pairs_a": [["green", "kite"], ["gray", "house"]],
+    "attribute_object_pairs_b": [["gray", "kite"], ["green", "house"]]
+  }
+]
