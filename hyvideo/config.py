@@ -12,7 +12,6 @@ def parse_args(namespace=None):
     parser = add_denoise_schedule_args(parser)
     parser = add_inference_args(parser)
     parser = add_parallel_args(parser)
-    parser = add_text_experiment_args(parser)
 
     args = parser.parse_args(namespace=namespace)
     args = sanity_check_args(args)
@@ -377,102 +376,6 @@ def add_parallel_args(parser: argparse.ArgumentParser):
         type=int,
         default=1,
         help="Ulysses degree.",
-    )
-
-    return parser
-
-
-def add_text_experiment_args(parser: argparse.ArgumentParser):
-    """Inference-only experiments on single-stream text-token usage.
-
-    All flags default to no-ops so normal generation behavior is unchanged
-    unless they are explicitly set.
-    """
-    group = parser.add_argument_group(title="Text-token experiment args")
-
-    # --- Semantic text skip connection (re-inject pre-dual text features) ---
-    # txt_single_input = txt_after_dual + alpha * anchor
-    #   raw:        anchor = txt_before_dual
-    #   norm_match: anchor = norm_match(txt_before_dual, txt_after_dual)
-    #   mid:        anchor = norm_match(txt_dual_block<mid>, txt_after_dual)
-    group.add_argument(
-        "--single-stream-text-skip",
-        type=str,
-        default="none",
-        choices=["none", "raw", "norm_match", "mid"],
-        help="Re-inject pre-dual (clean prompt-semantic) text into the text "
-        "tokens right before the single-stream stage. 'none' keeps the "
-        "default video-conditioned text; 'raw' adds the pre-dual text "
-        "directly; 'norm_match' RMS-matches it to the post-dual text first; "
-        "'mid' uses the text output of an intermediate double-stream block.",
-    )
-    group.add_argument(
-        "--single-stream-text-skip-alpha",
-        type=float,
-        default=0.0,
-        help="Skip-connection strength alpha. Typical values: 0.02, 0.05, 0.1, 0.2.",
-    )
-    group.add_argument(
-        "--single-stream-text-skip-mid-block",
-        type=int,
-        default=10,
-        help="Double-stream block index whose text output feeds the 'mid' skip.",
-    )
-
-    # --- Single-stream text ablation (none / zero / shuffle / scale) ---
-    group.add_argument(
-        "--single-stream-text-ablation",
-        type=str,
-        default="none",
-        choices=["none", "zero", "shuffle", "scale"],
-        help="Ablate text tokens right before the single-stream stage.",
-    )
-    group.add_argument(
-        "--single-stream-text-scale",
-        type=float,
-        default=1.0,
-        help="Scale factor applied to text when --single-stream-text-ablation is 'scale'.",
-    )
-    group.add_argument(
-        "--single-stream-debug-stats",
-        action="store_true",
-        help="Log small pooled token statistics during selected single-stream blocks.",
-    )
-    group.add_argument(
-        "--single-stream-debug-blocks",
-        type=str,
-        default="0,10,20,30,39",
-        help="Comma-separated single-stream block indices to log stats for.",
-    )
-    group.add_argument(
-        "--single-stream-debug-path",
-        type=str,
-        default="",
-        help="If set, append JSON-lines token statistics to this file.",
-    )
-
-    # --- Token drift diagnostics (dual -> single text-token evolution) ---
-    group.add_argument(
-        "--token-drift-debug",
-        action="store_true",
-        default=False,
-        help="Log how text tokens change from before dual-stream to before "
-        "single-stream, and how text-video alignment evolves through the "
-        "single-stream blocks. Inference-only.",
-    )
-    group.add_argument(
-        "--token-drift-debug-path",
-        type=str,
-        default="",
-        help="JSONL path for token drift stats. Defaults to "
-        "'token_drift_debug.jsonl' when empty.",
-    )
-    group.add_argument(
-        "--token-drift-debug-blocks",
-        type=str,
-        default="-1,0,10,20,30,39",
-        help="Comma-separated single-stream block indices to log drift stats for "
-        "(-1 = just before the first single-stream block).",
     )
 
     return parser
