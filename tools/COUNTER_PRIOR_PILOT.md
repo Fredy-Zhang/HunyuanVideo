@@ -8,7 +8,7 @@ counter-prior continuation gate.
 ## 1. Validate the plan without a GPU
 
 ```bash
-python tools/run_counter_prior_pilot.py --dry-run
+DRY_RUN=1 scripts/run_counter_prior_pilot.sh
 ```
 
 This writes `generation_manifest.csv` and `protocol.json` under
@@ -17,17 +17,25 @@ This writes `generation_manifest.csv` and `protocol.json` under
 ## 2. Generate the videos
 
 ```bash
-python tools/run_counter_prior_pilot.py \
-  --model-base ckpts \
-  --dit-weight ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt \
-  --video-size 544 960 \
-  --video-length 129 \
-  --infer-steps 50 \
-  --embedded-cfg-scale 6.0 \
-  --flow-shift 7.0 \
-  --flow-reverse \
-  --use-cpu-offload
+scripts/run_counter_prior_pilot.sh
 ```
+
+The wrapper defaults to the published 544x960, 129-frame configuration with
+CPU offload. Override settings through environment variables, for example:
+
+```bash
+MODEL_BASE=/models/HunyuanVideo/ckpts \
+DIT_WEIGHT=/models/HunyuanVideo/transformers/mp_rank_00_model_states_fp8.pt \
+USE_FP8=1 \
+PILOT_OUTPUT_ROOT=/experiments/counter_prior_pilot \
+scripts/run_counter_prior_pilot.sh
+```
+
+Supported environment overrides include `PYTHON_BIN`, `MODEL_BASE`,
+`DIT_WEIGHT`, `PILOT_OUTPUT_ROOT`, `PILOT_SEEDS`, `VIDEO_HEIGHT`, `VIDEO_WIDTH`,
+`VIDEO_LENGTH`, `INFER_STEPS`, `EMBEDDED_CFG_SCALE`, `FLOW_SHIFT`,
+`USE_CPU_OFFLOAD`, `USE_FP8`, and `DRY_RUN`. Additional command-line arguments
+are forwarded to the Python runner.
 
 The model is loaded once. Runs already present at their deterministic output
 paths are skipped by default, so rerunning resumes an interrupted pilot. Pass
@@ -40,7 +48,7 @@ preregistered seeds and `--pilot-output-root` to change the output directory.
 ## 3. Build review artifacts
 
 ```bash
-python tools/summarize_counter_prior_pilot.py
+scripts/summarize_counter_prior_pilot.sh
 ```
 
 Fill the boolean fields in `binding_annotations.csv` using `true` or `false`,

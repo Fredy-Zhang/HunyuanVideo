@@ -110,14 +110,17 @@ def labeled_row(run, frames):
 
 
 def build_contact_sheets(manifest, output_dir):
-    import cv2
-    import numpy as np
-
     grouped = defaultdict(list)
     for row in manifest:
         if row["status"] == "completed" and Path(row["output_video"]).exists():
             grouped[(row["pair_id"], row["seed"])].append(row)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if not grouped:
+        return []
+
+    import cv2
+    import numpy as np
+
     written = []
     for (pair_id, seed), rows in sorted(grouped.items()):
         if len(rows) != 2:
