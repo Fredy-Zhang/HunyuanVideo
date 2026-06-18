@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "description": "Seed-matched pilot prompts derived from findings.pptx.",
+  "pairs": [
+    {
+      "pair_id": "car",
+      "study_role": "prompt_edit_instability_control",
+      "prompts": [
+        {
+          "prompt_id": "red_car",
+          "condition": "control_a",
+          "text": "A red car drives past a white fence",
+          "target_attribute": "red",
+          "target_object": "car",
+          "secondary_attribute": "white",
+          "secondary_object": "fence"
+        },
+        {
+          "prompt_id": "blue_car",
+          "condition": "control_b",
+          "text": "A blue car drives past a white fence",
+          "target_attribute": "blue",
+          "target_object": "car",
+          "secondary_attribute": "white",
+          "secondary_object": "fence"
+        }
+      ]
+    },
+    {
+      "pair_id": "duck",
+      "study_role": "counter_prior_binding",
+      "prompts": [
+        {
+          "prompt_id": "yellow_duck_blue_towel",
+          "condition": "in_prior",
+          "text": "A yellow duck next to a blue towel",
+          "target_attribute": "yellow",
+          "target_object": "duck",
+          "secondary_attribute": "blue",
+          "secondary_object": "towel"
+        },
+        {
+          "prompt_id": "blue_duck_yellow_towel",
+          "condition": "counter_prior",
+          "text": "A blue duck next to a yellow towel",
+          "target_attribute": "blue",
+          "target_object": "duck",
+          "secondary_attribute": "yellow",
+          "secondary_object": "towel"
+        }
+      ]
+    },
+    {
+      "pair_id": "kite",
+      "study_role": "counter_prior_binding",
+      "prompts": [
+        {
+          "prompt_id": "green_kite_gray_house",
+          "condition": "in_prior",
+          "text": "A green kite flying above a gray house",
+          "target_attribute": "green",
+          "target_object": "kite",
+          "secondary_attribute": "gray",
+          "secondary_object": "house"
+        },
+        {
+          "prompt_id": "gray_kite_green_house",
+          "condition": "counter_prior",
+          "text": "A gray kite flying above a green house",
+          "target_attribute": "gray",
+          "target_object": "kite",
+          "secondary_attribute": "green",
+          "secondary_object": "house"
+        }
+      ]
+    }
+  ]
+}
